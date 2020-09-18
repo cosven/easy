@@ -1,1 +1,1 @@
-# TiDB Test Framework for Humans
+# TiDB System Testing Framework for Humans
