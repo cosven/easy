@@ -1,11 +1,8 @@
 package cases
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
-	"encoding/binary"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -13,105 +10,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pingcap/errors"
+	"github.com/cosven/easy/codec"
+
+	"database/sql"
+	_ "github.com/go-sql-driver/mysql"
 	"github.com/pingcap/parser/model"
 	"github.com/pingcap/tidb/tablecodec"
 	"github.com/pingcap/tidb/types"
-	"github.com/pingcap/tidb/util/codec"
-
 	"github.com/tikv/client-go/config"
 	"github.com/tikv/client-go/rawkv"
 )
-
-// x use modules
-func x() string {
-	if bytes.Equal([]byte{'x'}, []byte{'y'}) {
-		return hex.EncodeToString([]byte{'z'})
-	}
-	return "miao"
-}
-
-func decodeKey(key []byte) error {
-	b, decoded, err := codec.DecodeBytes(key, nil)
-	if err != nil {
-		return err
-	}
-	if len(decoded) == 19 && decoded[0] == 't' && decoded[9] == '_' && decoded[10] == 'r' {
-		_, table_id, _ := codec.DecodeInt(decoded[1:9])
-		_, row_id, _ := codec.DecodeInt(decoded[11:19])
-
-		fmt.Printf("table_id: %v, row_id: %v\n", table_id, row_id)
-
-		if len(b) == 8 {
-			_, ts, _ := codec.DecodeUintDesc(b)
-			ms := int64(ts >> 18)
-			fmt.Printf("ts: %v (%v)\n", ts, time.Unix(ms/1e3, (ms%1e3)*1e6))
-		}
-	}
-	return nil
-}
-
-func encodeRowKey(tableId, rowId int64) []byte {
-	key := []byte{'t'}
-	key = codec.EncodeInt(key, tableId)
-	key = append(key, []byte("_r")...)
-	key = codec.EncodeInt(key, rowId)
-	return codec.EncodeBytes([]byte{}, key)
-}
-
-func KvEncodeKey(key []byte, ts uint64) []byte {
-	return codec.EncodeUintDesc(key, ts)
-}
-
-func EncodeValue(writeType []byte, startTs uint64, value []byte) {
-
-}
-
-func DecodeUint8(b []byte) ([]byte, uint8, error) {
-	if len(b) < 1 {
-		return nil, 0, errors.New("insufficient bytes to decode value")
-	}
-
-	var v uint8
-	buf := bytes.NewReader(b)
-	err := binary.Read(buf, binary.BigEndian, &v)
-	if err != nil {
-		return b, 0, err
-	}
-	b = b[1:]
-	return b, v, nil
-}
-
-func DecodeValue(b []byte) error {
-	b, writeType, err := DecodeUint8(b)
-	if err != nil {
-		return err
-	}
-	fmt.Printf("write_type: %v\n", string(byte(writeType)))
-	b, startTs, err := codec.DecodeUvarint(b)
-	if err != nil {
-		return err
-	}
-	fmt.Printf("start_ts: %v\n", startTs)
-	// TODO: currently, we assume the value is a shortvalue
-	// read the short value prefix b'v'
-	b, _, err = DecodeUint8(b)
-	if err != nil {
-		return err
-	}
-	b, length, err := DecodeUint8(b)
-	if err != nil {
-		return err
-	}
-	if len(b) < int(length) {
-		panic(fmt.Sprintf("content len %d shorter that value len %d", len(b), length))
-	}
-	value := b[:length]
-	// TODO: currently, we ignore the remain bytes
-	fmt.Printf("value: %s\n", string(value))
-	DecodeRow(value)
-	return nil
-}
 
 func DecodeRow(value []byte) error {
 	resp, err := http.Get("http://127.0.0.1:10080/schema/test/t")
@@ -146,6 +54,22 @@ func DecodeRow(value []byte) error {
 	return nil
 }
 
+func TestGetSafePoint(t *testing.T) {
+	db, err := sql.Open("mysql", "root:@tcp(127.0.0.1:4000)/test")
+	if err != nil {
+		panic(err)
+	}
+	rows, err := db.Query(`select VARIABLE_VALUE from mysql.tidb where VARIABLE_NAME = "tikv_gc_safe_point";`)
+	if err != nil {
+		panic(err)
+	}
+	defer rows.Close()
+	var safePoint time.Time
+	rows.Next()
+	rows.Scan(safePoint)
+	fmt.Println(safePoint)
+}
+
 func TestDecodeRow(t *testing.T) {
 	data, err := base64.StdEncoding.DecodeString("gAABAAAAAgQATWFyeQ==")
 	if err != nil {
@@ -163,15 +87,16 @@ func TestRawkv(t *testing.T) {
 	}
 	defer cli.Close()
 
-	key := encodeRowKey(45, 2)
+	key := codec.EncodeIntRowKey(45, 2)
 	commitTs := uint64(420326424217649154)
-	kvKey := KvEncodeKey(key, commitTs)
+	kvKey := codec.EncodeWriteKey(key, commitTs)
 	value, err := cli.Get(context.TODO(), kvKey, rawkv.GetOption{Cf: rawkv.CfWrite})
 	if err != nil {
 		panic(err)
 	}
-	err = DecodeValue(value)
+	write, err := codec.NewWriteFromValue(value)
 	if err != nil {
 		panic(err)
 	}
+	DecodeRow(write.ShortValue)
 }
