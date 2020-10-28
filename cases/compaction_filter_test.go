@@ -2,101 +2,75 @@ package cases
 
 import (
 	"context"
-	"encoding/base64"
-	"encoding/json"
-	"fmt"
-	"io/ioutil"
-	"net/http"
 	"testing"
-	"time"
 
 	"github.com/cosven/easy/codec"
+	easytidb "github.com/cosven/easy/easytidb"
 
-	"database/sql"
 	_ "github.com/go-sql-driver/mysql"
-	"github.com/pingcap/parser/model"
-	"github.com/pingcap/tidb/tablecodec"
 	"github.com/pingcap/tidb/types"
 	"github.com/tikv/client-go/config"
 	"github.com/tikv/client-go/rawkv"
 )
 
-func DecodeRow(value []byte) error {
-	resp, err := http.Get("http://127.0.0.1:10080/schema/test/t")
+func failIfError(t *testing.T, err error) {
 	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-	var tableInfo model.TableInfo
-	err = json.Unmarshal(body, &tableInfo)
-	if err != nil {
-		return err
-	}
-	colMap := make(map[int64]*types.FieldType, len(tableInfo.Columns))
-	for _, col := range tableInfo.Columns {
-		colMap[col.ID] = &col.FieldType
-	}
-
-	rs, err := tablecodec.DecodeRowToDatumMap(value, colMap, time.UTC)
-	for _, col := range tableInfo.Columns {
-		if c, ok := rs[col.ID]; ok {
-			data := "nil"
-			if !c.IsNull() {
-				data, err = c.ToString()
-			}
-			fmt.Printf("name: %s, value: %s\n", col.Name.O, data)
-		}
-	}
-	return nil
-}
-
-func TestGetSafePoint(t *testing.T) {
-	db, err := sql.Open("mysql", "root:@tcp(127.0.0.1:4000)/test")
-	if err != nil {
-		panic(err)
-	}
-	rows, err := db.Query(`select VARIABLE_VALUE from mysql.tidb where VARIABLE_NAME = "tikv_gc_safe_point";`)
-	if err != nil {
-		panic(err)
-	}
-	defer rows.Close()
-	var safePoint time.Time
-	rows.Next()
-	rows.Scan(safePoint)
-	fmt.Println(safePoint)
-}
-
-func TestDecodeRow(t *testing.T) {
-	data, err := base64.StdEncoding.DecodeString("gAABAAAAAgQATWFyeQ==")
-	if err != nil {
-		panic(err)
-	}
-	if err := DecodeRow(data); err != nil {
-		panic(err)
+		t.Error(err)
 	}
 }
 
-func TestRawkv(t *testing.T) {
-	cli, err := rawkv.NewClient(context.TODO(), []string{"127.0.0.1:2379"}, config.Default())
-	if err != nil {
-		panic(err)
-	}
-	defer cli.Close()
+func TestWriteRow(t *testing.T) {
+	pdAddrs := []string{"127.0.0.1:2379"}
+	tidbStatusAddr := "127.0.0.1:10080"
 
-	key := codec.EncodeIntRowKey(45, 2)
-	commitTs := uint64(420326424217649154)
-	kvKey := codec.EncodeWriteKey(key, commitTs)
-	value, err := cli.Get(context.TODO(), kvKey, rawkv.GetOption{Cf: rawkv.CfWrite})
-	if err != nil {
-		panic(err)
+	kvCli, err := rawkv.NewClient(context.TODO(), pdAddrs, config.Default())
+	failIfError(t, err)
+	defer kvCli.Close()
+	tableInfo, err := easytidb.GetTableInfoFromTidbStatus(tidbStatusAddr, "test", "t")
+	failIfError(t, err)
+	safepoint, err := GetSafePointFromPd(pdAddrs)
+	failIfError(t, err)
+	physical := safepoint >> 18
+
+	// construct key
+	rowId := int64(2333)
+	oldStartTs := (physical - 4) << 18
+	oldCommitTs := (physical - 3) << 18
+	newStartTs := (physical - 2) << 18
+	newCommitTs := (physical - 1) << 18
+
+	key := codec.EncodeIntRowKey(tableInfo.ID, rowId)
+	oldRawKey := codec.EncodeWriteKey(key, oldCommitTs)
+	newRawKey := codec.EncodeWriteKey(key, newCommitTs)
+
+	// construct value
+	oldRow := []types.Datum{types.NewIntDatum(2333), types.NewStringDatum("Alex")}
+	newRow := []types.Datum{types.NewIntDatum(2333), types.NewStringDatum("Alex!")}
+	colIDs := make([]int64, len(tableInfo.Columns))
+	for i, col := range tableInfo.Columns {
+		colIDs[i] = col.ID
 	}
-	write, err := codec.NewWriteFromValue(value)
-	if err != nil {
-		panic(err)
+	oldValue, err := SimpleEncodeRow(oldRow, colIDs)
+	newValue, err := SimpleEncodeRow(newRow, colIDs)
+	failIfError(t, err)
+
+	// construct tikv value
+	oldWrite := codec.Write{
+		WriteType:  codec.WriteTypePut,
+		StartTs:    oldStartTs,
+		ShortValue: oldValue,
 	}
-	DecodeRow(write.ShortValue)
+	newWrite := codec.Write{
+		WriteType:  codec.WriteTypePut,
+		StartTs:    newStartTs,
+		ShortValue: newValue,
+	}
+	oldRawValue := oldWrite.ToValue()
+	newRawValue := newWrite.ToValue()
+	err = kvCli.Put(context.TODO(), oldRawKey, oldRawValue,
+		rawkv.PutOption{Cf: rawkv.CfWrite})
+	failIfError(t, err)
+	err = kvCli.Put(context.TODO(), newRawKey, newRawValue,
+		rawkv.PutOption{Cf: rawkv.CfWrite})
+	failIfError(t, err)
 }
