@@ -41,7 +41,7 @@ func EncodeWriteKey(key []byte, commitTs uint64) []byte {
 
 // DecodeWriteKey decodes the EncodeWriteKey value
 func DecodeWriteKey(key []byte) ([]byte, uint64, error) {
-	tsLength := 64
+	tsLength := 8
 	if len(key) < tsLength {
 		return nil, 0, errors.New("insufficient bytes to decode value")
 	}

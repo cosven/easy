@@ -2,7 +2,7 @@ module github.com/cosven/easy
 
 go 1.14
 
-replace github.com/tikv/client-go v0.0.0-20201015080021-528475568618 => ../client-go
+replace github.com/tikv/client-go v0.0.0-20201015080021-528475568618 => github.com/cosven/client-go v0.0.0-20201029085241-63a1539d6469
 
 replace go.etcd.io/etcd/v3 => github.com/etcd-io/etcd/v3 v3.3.0-rc.0.0.20200826232710-c20cc05fc548
 

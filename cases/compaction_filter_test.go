@@ -3,7 +3,7 @@ package cases
 import (
 	"bytes"
 	"context"
-	"database/sql"
+	"fmt"
 	"testing"
 	"time"
 
@@ -15,9 +15,7 @@ import (
 	"github.com/pingcap/kvproto/pkg/debugpb"
 	"github.com/pingcap/log"
 	"github.com/pingcap/tidb/types"
-	"github.com/tikv/client-go/config"
 	"github.com/tikv/client-go/rawkv"
-	"go.uber.org/zap"
 )
 
 func failIfError(t *testing.T, err error) {
@@ -26,140 +24,122 @@ func failIfError(t *testing.T, err error) {
 	}
 }
 
-func triggerGCASAP() error {
-	db, err := sql.Open("mysql", "root:@tcp(127.0.0.1:4000)/test")
+const (
+	dbName    string = "test"
+	tableName string = "t"
+	rowId     int64  = 2333
+)
+
+// TableTestT represents the table `t` in database `test`
+type TableTestT struct {
+	id     int64
+	colIDs []int64
+}
+
+func mustNewTestT(tc tidbCluster) *TableTestT {
+	tableInfo, err := easytidb.GetTableInfoFromTidbStatus(tc.tidbStatusAddr, "test", "t")
 	if err != nil {
-		return err
+		log.Fatal(err.Error())
 	}
-	defer db.Close()
-	_, err = db.Exec(`update mysql.tidb set VARIABLE_VALUE="1m" where VARIABLE_NAME="tikv_gc_run_interval";`)
-	return err
+	colIDs := make([]int64, len(tableInfo.Columns))
+	for i, col := range tableInfo.Columns {
+		colIDs[i] = col.ID
+	}
+	return &TableTestT{
+		id:     tableInfo.ID,
+		colIDs: colIDs,
+	}
 }
 
-func TestPrepare(t *testing.T) {
-	failIfError(t, triggerGCASAP())
+func (t *TableTestT) mustGenRowKV(rowId int64, startTs, commitTs uint64) ([]byte, []byte) {
+	key := codec.EncodeIntRowKey(t.id, rowId)
+	rawKey := codec.EncodeWriteKey(key, commitTs)
+
+	name := fmt.Sprintf("Alex - %d", commitTs)
+	row := []types.Datum{types.NewIntDatum(rowId), types.NewStringDatum(name)}
+
+	value, err := SimpleEncodeRow(row, t.colIDs)
+	if err != nil {
+		log.Fatal(err.Error())
+	}
+	write := codec.Write{
+		WriteType:  codec.WriteTypePut,
+		StartTs:    startTs,
+		ShortValue: value,
+	}
+	rawValue := write.ToValue()
+	return rawKey, rawValue
 }
 
-func TestWriteRow(t *testing.T) {
-	pdAddrs := []string{"127.0.0.1:2379"}
-	tidbStatusAddr := "127.0.0.1:10080"
+func TestSetup(t *testing.T) {
+	tc := NewSimpleTidbCluster()
+	tc.triggerGCASAP()
+	tc.mustExecSql("drop table if exists t;")
+	tc.mustExecSql("create table t(id int primary key, name varchar(255));")
+}
 
-	prepareTable := func() {
-		db, err := sql.Open("mysql", "root:@tcp(127.0.0.1:4000)/test")
-		failIfError(t, err)
-		defer db.Close()
-		_, err = db.Exec("drop table if exists t;")
-		failIfError(t, err)
-		_, err = db.Exec("create table t(i int primary key, name varchar(255));")
-		failIfError(t, err)
-	}
-	prepareTable()
-
-	kvCli, err := rawkv.NewClient(context.TODO(), pdAddrs, config.Default())
-	failIfError(t, err)
+func TestCompactShouldDeleteOldKey(t *testing.T) {
+	tc := NewSimpleTidbCluster()
+	kvCli := tc.mustNewRawkvClient()
 	defer kvCli.Close()
-	tableInfo, err := easytidb.GetTableInfoFromTidbStatus(tidbStatusAddr, "test", "t")
+	debugCli := tc.mustNewDebugClient()
+	tableT := mustNewTestT(*tc)
+
+	// insert two keys(commit_ts < safepoint) into write cf
+	// the old key is supposed to be delete in next gc round
+	safepoint := tc.mustGetSafePoint()
+	physical := safepoint >> 18
+	oldStartTs := (physical - 2) << 18
+	oldCommitTs := oldStartTs + 1000
+	newStartTs := (physical - 1) << 18
+	newCommitTs := newStartTs + 1000
+	rowId := int64(2333)
+
+	oldRawKey, oldRawValue := tableT.mustGenRowKV(rowId, oldStartTs, oldCommitTs)
+	newRawKey, newRawValue := tableT.mustGenRowKV(rowId, newStartTs, newCommitTs)
+
+	err := kvCli.Put(context.TODO(), oldRawKey, oldRawValue, rawkv.PutOption{Cf: rawkv.CfWrite})
 	failIfError(t, err)
-	rowId := int64(2334)
-	key := codec.EncodeIntRowKey(tableInfo.ID, rowId)
+	err = kvCli.Put(context.TODO(), newRawKey, newRawValue, rawkv.PutOption{Cf: rawkv.CfWrite})
+	failIfError(t, err)
 
-	var oldRawKey, oldRawValue []byte
-
-	prepareRows := func() {
-		safepoint, err := GetSafePointFromPd(pdAddrs)
-		failIfError(t, err)
-		physical := safepoint >> 18
-		log.Info("got safepoint", zap.Uint64("safepoint", safepoint))
-
-		oldStartTs := (physical - 4) << 18
-		oldCommitTs := (physical - 3) << 18
-		newStartTs := (physical - 2) << 18
-		newCommitTs := (physical - 1) << 18
-
-		oldRawKey = codec.EncodeWriteKey(key, oldCommitTs)
-		newRawKey := codec.EncodeWriteKey(key, newCommitTs)
-
-		// construct value
-		oldRow := []types.Datum{types.NewIntDatum(2333), types.NewStringDatum("Alex")}
-		newRow := []types.Datum{types.NewIntDatum(2333), types.NewStringDatum("Alex!!")}
-		colIDs := make([]int64, len(tableInfo.Columns))
-		for i, col := range tableInfo.Columns {
-			colIDs[i] = col.ID
-		}
-		oldValue, err := SimpleEncodeRow(oldRow, colIDs)
-		newValue, err := SimpleEncodeRow(newRow, colIDs)
-		failIfError(t, err)
-
-		// construct tikv value
-		oldWrite := codec.Write{
-			WriteType:  codec.WriteTypePut,
-			StartTs:    oldStartTs,
-			ShortValue: oldValue,
-		}
-		newWrite := codec.Write{
-			WriteType:  codec.WriteTypePut,
-			StartTs:    newStartTs,
-			ShortValue: newValue,
-		}
-		oldRawValue = oldWrite.ToValue()
-		newRawValue := newWrite.ToValue()
-		err = kvCli.Put(context.TODO(), oldRawKey, oldRawValue,
-			rawkv.PutOption{Cf: rawkv.CfWrite})
-		failIfError(t, err)
-		err = kvCli.Put(context.TODO(), newRawKey, newRawValue,
-			rawkv.PutOption{Cf: rawkv.CfWrite})
-		failIfError(t, err)
-	}
-	prepareRows()
-
-	// manual compact
-	debugCli := debug.NewDebugClient("http://127.0.0.1:20160")
+	// trigger compaction on write cf
 	err = debugCli.Compact(context.TODO(), debugpb.DB_KV, "write",
 		debug.WithBottommostLevelCompaction(debugpb.BottommostLevelCompaction_Force))
 	failIfError(t, err)
 
 	// wait for compaction finish
 	// FIXME
+	log.Info("sleep 5 seconds to wait for compaction finish")
 	time.Sleep(time.Second * 5)
 
+	// the old value should be gc during compaction
 	value, err := kvCli.Get(context.TODO(), oldRawKey, rawkv.GetOption{Cf: rawkv.CfWrite})
 	failIfError(t, err)
 	if bytes.Equal(value, oldRawValue) {
-		println("failed")
-	} else {
-		println("ok")
+		t.FailNow()
 	}
-
-	keys, _, err := kvCli.Scan(context.TODO(), key, nil, 100, rawkv.ScanOption{Cf: rawkv.CfWrite})
-	failIfError(t, err)
-	println(len(keys))
-	for _, key := range keys {
-		println(string(key))
-	}
-
 }
 
-func TestScan(t *testing.T) {
-	pdAddrs := []string{"127.0.0.1:2379"}
-	tidbStatusAddr := "127.0.0.1:10080"
-
-	kvCli, err := rawkv.NewClient(context.TODO(), pdAddrs, config.Default())
-	failIfError(t, err)
+// TestScan is used for debug
+func TestDebug(t *testing.T) {
+	tc := NewSimpleTidbCluster()
+	safepoint := tc.mustGetSafePoint()
+	kvCli := tc.mustNewRawkvClient()
 	defer kvCli.Close()
-	tableInfo, err := easytidb.GetTableInfoFromTidbStatus(tidbStatusAddr, "test", "t")
-	failIfError(t, err)
-
-	// construct key
-	rowId := int64(1)
-
-	key := codec.EncodeIntRowKey(tableInfo.ID, rowId)
-
+	tableT := mustNewTestT(*tc)
+	key := codec.EncodeIntRowKey(tableT.id, 0)
 	keys, _, err := kvCli.Scan(context.TODO(), key, nil, 100, rawkv.ScanOption{Cf: rawkv.CfWrite})
 	failIfError(t, err)
-	println(len(keys))
+	fmt.Printf("total keys: %d\n", len(keys))
+	fmt.Printf("safepoint: %d\n", safepoint)
 	for _, key := range keys {
-		_, rowId, err = codec.DecodeIntRowKey(key)
+		userKey, ts, err := codec.DecodeWriteKey(key)
+		if err != nil {
+			continue
+		}
+		_, rowId, err := codec.DecodeIntRowKey(userKey)
 		failIfError(t, err)
-		println(rowId)
+		fmt.Printf("%d, %d, %v\n", rowId, ts, ts < safepoint)
 	}
 }
